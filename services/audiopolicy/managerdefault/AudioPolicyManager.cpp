@@ -2689,7 +2689,8 @@ status_t AudioPolicyManager::startSource(const sp<SwAudioOutputDescriptor>& outp
         // apply volume rules for current stream and device if necessary
         auto &curves = getVolumeCurves(client->attributes());
         if (NO_ERROR != checkAndSetVolume(curves, client->volumeSource(),
-                          curves.getVolumeIndex(outputDesc->devices().types()),
+                          getVolumeIndexForVolumeSource(curves, client->volumeSource(),
+                                  outputDesc->devices().types()),
                           outputDesc, outputDesc->devices().types(), true /*adjustAttenuation*/,
                           0 /*delay*/, outputDesc->useHwGain() /*force*/)) {
             // request AudioService to reinitialize the volume curves asynchronously
@@ -3840,7 +3841,7 @@ status_t AudioPolicyManager::setVolumeIndexForGroup(volume_group_t group,
         ALOGE("%s: Invalid src %d: no valid attributes nor stream",__func__, vs);
         return BAD_VALUE;
     }
-    audio_devices_t curSrcDevice = Volume::getDeviceForVolume(curSrcDevices);
+    audio_devices_t curSrcDevice = getVolumeDeviceForVolumeSource(vs, curSrcDevices);
     resetDeviceTypes(curSrcDevices, curSrcDevice);
 
     // update volume on all outputs and streams matching the following:
@@ -3871,8 +3872,8 @@ status_t AudioPolicyManager::setVolumeIndexForGroup(volume_group_t group,
         if (device != AUDIO_DEVICE_OUT_DEFAULT_FOR_VOLUME) {
             curSrcDevices.insert(device);
             applyVolume = (curSrcDevices.find(
-                    Volume::getDeviceForVolume(curDevices)) != curSrcDevices.end())
-                    && Volume::getDeviceForVolume(curSrcDevices) == device;
+                    getVolumeDeviceForVolumeSource(vs, curDevices)) != curSrcDevices.end())
+                    && getVolumeDeviceForVolumeSource(vs, curSrcDevices) == device;
         } else {
             applyVolume = !curves.hasVolumeIndexForDevice(curSrcDevice);
         }
@@ -3950,6 +3951,37 @@ status_t AudioPolicyManager::setVolumeCurveIndex(int index,
     return NO_ERROR;
 }
 
+audio_devices_t AudioPolicyManager::getVolumeDeviceForVolumeSource(
+        VolumeSource volumeSource, DeviceTypeSet deviceTypes) const
+{
+    if (deviceTypes.erase(AUDIO_DEVICE_OUT_SPEAKER_SAFE)) {
+        deviceTypes.insert(AUDIO_DEVICE_OUT_SPEAKER);
+    }
+
+    // Keep this ring/alarm-specific volume key selection aligned with AudioService.
+    const auto ringVolumeSrc = toVolumeSource(AUDIO_STREAM_RING, false);
+    const auto alarmVolumeSrc = toVolumeSource(AUDIO_STREAM_ALARM, false);
+    if (((ringVolumeSrc != VOLUME_SOURCE_NONE && volumeSource == ringVolumeSrc)
+            || (alarmVolumeSrc != VOLUME_SOURCE_NONE && volumeSource == alarmVolumeSrc))
+            && deviceTypes.size() == 2
+            && deviceTypes.count(AUDIO_DEVICE_OUT_SPEAKER) != 0) {
+        std::vector<audio_devices_t> volumeDevices = Intersection(
+                deviceTypes, getAudioDeviceOutPickForVolumeSet());
+        if (volumeDevices.size() == 1) {
+            return volumeDevices[0];
+        }
+    }
+
+    return Volume::getDeviceForVolume(deviceTypes);
+}
+
+int AudioPolicyManager::getVolumeIndexForVolumeSource(const IVolumeCurves &curves,
+                                                      VolumeSource volumeSource,
+                                                      const DeviceTypeSet& deviceTypes) const
+{
+    return curves.getVolumeIndex({getVolumeDeviceForVolumeSource(volumeSource, deviceTypes)});
+}
+
 status_t AudioPolicyManager::getVolumeIndexForAttributes(const audio_attributes_t &attr,
                                                          int &index,
                                                          audio_devices_t device) {
@@ -3965,12 +3997,18 @@ status_t AudioPolicyManager::getVolumeIndexForGroup(volume_group_t groupId, int 
     }
     // If device is AUDIO_DEVICE_OUT_DEFAULT_FOR_VOLUME, return volume for device selected for this
     // stream by the engine.
+    IVolumeCurves &curves = getVolumeCurves(groupId);
     DeviceTypeSet deviceTypes = {device};
     if (device == AUDIO_DEVICE_OUT_DEFAULT_FOR_VOLUME) {
         deviceTypes = mEngine->getOutputDevicesForAttributes(
                 mEngine->getAttributesForVolumeGroup(groupId), nullptr, true /*fromCache*/).types();
+        const auto volumeSource = toVolumeSource(groupId);
+        const auto volumeDevice = getVolumeDeviceForVolumeSource(volumeSource, deviceTypes);
+        if (volumeDevice != Volume::getDeviceForVolume(deviceTypes)) {
+            return getVolumeIndex(curves, index, {volumeDevice});
+        }
     }
-    return getVolumeIndex(getVolumeCurves(groupId), index, deviceTypes);
+    return getVolumeIndex(curves, index, deviceTypes);
 }
 
 status_t AudioPolicyManager::getVolumeIndex(const IVolumeCurves &curves,
@@ -8831,7 +8869,7 @@ status_t AudioPolicyManager::checkAndSetVolume(IVolumeCurves &curves,
     updateVoiceBtScoVolumeSrcForCalls(volumeSource, isVoiceVolSrc, isBtScoVolSrc);
     if (deviceTypes.empty()) {
         deviceTypes = outputDesc->devices().types();
-        index = curves.getVolumeIndex(deviceTypes);
+        index = getVolumeIndexForVolumeSource(curves, volumeSource, deviceTypes);
         ALOGV("%s if deviceTypes is change from none to device %s, need get index %d",
                 __func__, dumpDeviceTypes(deviceTypes).c_str(), index);
     }
@@ -8917,8 +8955,10 @@ void AudioPolicyManager::applyStreamVolumes(const sp<AudioOutputDescriptor>& out
 {
     ALOGVV("applyStreamVolumes() for device %s", dumpDeviceTypes(deviceTypes).c_str());
     for (const auto &volumeGroup : mEngine->getVolumeGroups()) {
-        auto &curves = getVolumeCurves(toVolumeSource(volumeGroup));
-        checkAndSetVolume(curves, toVolumeSource(volumeGroup), curves.getVolumeIndex(deviceTypes),
+        const auto volumeSource = toVolumeSource(volumeGroup);
+        auto &curves = getVolumeCurves(volumeSource);
+        checkAndSetVolume(curves, volumeSource,
+                          getVolumeIndexForVolumeSource(curves, volumeSource, deviceTypes),
                           outputDesc, deviceTypes, /*adjustAttenuation=*/true, delayMs, force);
     }
 }
@@ -8978,7 +9018,7 @@ void AudioPolicyManager::setVolumeSourceMutedInternally(VolumeSource volumeSourc
         }
         if (outputDesc->decMuteCount(volumeSource) == 0) {
             checkAndSetVolume(curves, volumeSource,
-                              curves.getVolumeIndex(deviceTypes),
+                              getVolumeIndexForVolumeSource(curves, volumeSource, deviceTypes),
                               outputDesc,
                               deviceTypes,
                               /*adjustAttenuation=*/true,

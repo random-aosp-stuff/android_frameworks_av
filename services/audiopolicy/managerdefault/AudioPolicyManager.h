@@ -254,6 +254,13 @@ public:
                                      audio_devices_t device,
                                      IVolumeCurves &volumeCurves);
 
+        audio_devices_t getVolumeDeviceForVolumeSource(VolumeSource volumeSource,
+                                                       DeviceTypeSet deviceTypes) const;
+
+        int getVolumeIndexForVolumeSource(const IVolumeCurves &curves,
+                                          VolumeSource volumeSource,
+                                          const DeviceTypeSet& deviceTypes) const;
+
         status_t getVolumeIndex(const IVolumeCurves &curves, int &index,
                                 const DeviceTypeSet& deviceTypes) const;
 
